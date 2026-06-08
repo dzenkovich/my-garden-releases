@@ -344,8 +344,15 @@ class OtaManager:
     def _write_version_file(self, state):
         import json
 
-        with open(VERSION_FILE, "w") as f:
+        # Write-then-rename so a reset/power-loss mid-write can never leave a
+        # truncated /version.json (a half-written file fails json.load on the
+        # next boot, which would lose the installed-version + rollback record).
+        tmp = VERSION_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(state, f)
+            f.flush()
+        self._safe_remove(VERSION_FILE)
+        os.rename(tmp, VERSION_FILE)
 
     def _ensure_parent_dir(self, path):
         if "/" not in path.strip("/"):

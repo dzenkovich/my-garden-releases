@@ -14,9 +14,11 @@ from ble_services import ProvisioningService, DeviceInformationService
 from hardware_manager import HardwareManager
 from mqtt_manager import MqttManager
 
-# Running application-code version. Bump this on every release; the OTA manifest
-# compares against it to decide whether an update is available.
-__version__ = "1.0.0"
+# Factory default version, used only on a fresh USB flash. After an OTA the
+# installed version is read from /version.json (see _installed_version), which is
+# what the device reports and what the OTA check compares against the manifest.
+# Bump this to match each release you cut so a fresh flash reports correctly.
+__version__ = "1.1.1"
 
 
 class MyGarden:
@@ -330,10 +332,28 @@ class MyGarden:
             except Exception as e:
                 print(f"Failed to publish OTA status: {e}")
 
+    def _installed_version(self):
+        """The version actually running on the device.
+
+        `/version.json` (written by the last successful OTA) is authoritative;
+        the baked-in `__version__` is only the factory default for a fresh USB
+        flash. This keeps the reported/compared version correct even if a
+        release forgot to bump the `__version__` constant -- the manifest
+        version is what was installed, so that's what we report and diff."""
+        try:
+            with open("/version.json") as f:
+                v = json.load(f).get("version")
+            if v:
+                return v
+        except (OSError, ValueError):
+            pass
+        return __version__
+
     def _ensure_ota_manager(self):
         if self.ota_manager is None:
             from ota_manager import OtaManager
-            self.ota_manager = OtaManager(__version__, status_cb=self._publish_ota_status)
+            self.ota_manager = OtaManager(
+                self._installed_version(), status_cb=self._publish_ota_status)
         return self.ota_manager
 
     def handle_ota_check(self):
@@ -371,7 +391,8 @@ class MyGarden:
         # Announce the running version (retained) so the app can show it and
         # decide whether an update is available.
         try:
-            self.mqtt_manager.publish(self.VERSION_TOPIC, __version__, retain=True)
+            self.mqtt_manager.publish(
+                self.VERSION_TOPIC, self._installed_version(), retain=True)
         except Exception as e:
             print(f"Failed to publish version: {e}")
         # Clear any stale retained OTA status left over from a previous apply +
