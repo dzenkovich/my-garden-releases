@@ -180,17 +180,36 @@ class OtaManager:
         state = self._read_version_file()
         if state.get("boot_pending"):
             state["boot_pending"] = False
+            state["boot_attempts"] = 0
             self._write_version_file(state)
             print("OTA: boot confirmed OK, watchdog cleared")
 
     def rollback_if_pending(self):
-        """If the last install never confirmed a clean boot, restore the .bak
-        copies and reset. Call this very early at boot."""
+        """Boot watchdog. Call this very early at boot.
+
+        After a commit, `boot_pending` is True and we reboot into the new code.
+        The FIRST boot must be allowed to run so the main loop can reach
+        `confirm_boot_ok()` and clear the flag -- otherwise a freshly-installed
+        (and perfectly good) version would be reverted before it ever ran. We
+        only roll back if a boot attempt was already recorded but never
+        confirmed (i.e. the new code crashed before the first clean loop). The
+        GP2/USB jumper remains the hard fallback."""
         state = self._read_version_file()
         if not state.get("boot_pending"):
             return False
+
+        # First boot after install: record the attempt and let the new code run.
+        # confirm_boot_ok() clears boot_pending once a clean loop completes.
+        attempts = state.get("boot_attempts", 0)
+        if attempts < 1:
+            state["boot_attempts"] = attempts + 1
+            self._write_version_file(state)
+            print("OTA: first boot of new version -> giving it a chance")
+            return False
+
+        # Booted into this version before and it never confirmed -> bad code.
         files = state.get("files") or []
-        print("OTA: boot-pending detected -> rolling back")
+        print("OTA: unconfirmed boot -> rolling back")
         restored = False
         for path in files:
             bak = path + BACKUP_SUFFIX
@@ -202,6 +221,7 @@ class OtaManager:
             os.rename(bak, path)
             restored = True
         state["boot_pending"] = False
+        state["boot_attempts"] = 0
         state["version"] = state.get("previous_version", self.current_version)
         self._write_version_file(state)
         if restored:

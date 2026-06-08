@@ -374,6 +374,12 @@ class MyGarden:
             self.mqtt_manager.publish(self.VERSION_TOPIC, __version__, retain=True)
         except Exception as e:
             print(f"Failed to publish version: {e}")
+        # Clear any stale retained OTA status left over from a previous apply +
+        # reboot. Without this the app would re-receive the retained "installing"
+        # / "rebooting" status on reconnect and stay stuck on the progress
+        # spinner. OTA only runs from the main loop (never across a boot), so
+        # "idle" is always the correct state at startup.
+        self._publish_ota_status("idle")
 
     @staticmethod
     def compute_light_fraction(local_min, center_min, photoperiod_hours, fade_min):
