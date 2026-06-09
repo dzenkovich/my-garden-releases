@@ -86,6 +86,12 @@ class MyGarden:
         self._load_light_config()
         self.lux_avg = None  # smoothed luminosity feeding the closed loop
 
+        # Deferred persistence of manual brightness: a slider drag sends a burst
+        # of values, so we apply PWM immediately but write /light_config.json
+        # only once the slider settles (keeps the lamp responsive, spares flash).
+        self._light_config_dirty = False
+        self._light_config_dirty_since = 0
+
         self.rtc = rtc.RTC()
 
     def _get_or_create_device_id(self):
@@ -115,13 +121,24 @@ class MyGarden:
             print("No saved light config; using defaults.")
 
     def _save_light_config(self):
-        # Called only on config/mode/brightness changes (never in the loop) to
-        # limit flash wear.
+        # Called on config/mode changes and (debounced) brightness changes to
+        # limit flash wear. Clears any pending deferred write.
+        self._light_config_dirty = False
         try:
             with open(self.LIGHT_CONFIG_FILE, "w") as f:
                 json.dump(self.light_config, f)
         except Exception as e:
             print(f"Failed to save light config: {e}")
+
+    # Debounce window (s) for persisting manual brightness after the last change.
+    LIGHT_CONFIG_SAVE_DELAY = 2
+
+    def _flush_pending_light_config(self, now):
+        """Persist a pending manual-brightness change once the slider has been
+        quiet for LIGHT_CONFIG_SAVE_DELAY seconds."""
+        if (self._light_config_dirty
+                and (now - self._light_config_dirty_since) > self.LIGHT_CONFIG_SAVE_DELAY):
+            self._save_light_config()
 
     def connect_wifi(self):
         try:
@@ -226,6 +243,21 @@ class MyGarden:
 
             current_time = time.monotonic()
 
+            # Service incoming MQTT every iteration -- NOT only inside the 3s
+            # sensor block below -- so control commands (led_brightness,
+            # light_mode, ...) are dispatched to on_message() within one loop
+            # tick instead of waiting up to a full PUBLISH_INTERVAL.
+            if self.wifi_connected and self.mqtt_manager:
+                try:
+                    self.mqtt_manager.loop()
+                    if not self.mqtt_manager.is_connected():
+                        self.mqtt_manager.reconnect()
+                except Exception as e:
+                    print(f"MQTT Error servicing loop: {e}")
+
+            # Persist a deferred manual-brightness change once the slider settles.
+            self._flush_pending_light_config(current_time)
+
             if self.hw_manager.temp_humid_sensor is None or self.hw_manager.lum_sensor is None:
                 if current_time - self._last_sensor_init >= sensor_retry_interval:
                     self._last_sensor_init = current_time
@@ -245,27 +277,22 @@ class MyGarden:
 
                 self.log_sensor_data(temp, humid, luminosity)
 
-                if self.wifi_connected and self.mqtt_manager:
+                if self.wifi_connected and self.mqtt_manager and self.mqtt_manager.is_connected():
                     try:
-                        self.mqtt_manager.loop()
-                        if not self.mqtt_manager.is_connected():
-                            self.mqtt_manager.reconnect()
-                        else:
-                            # Publish data if changed
-                            is_overdue = (current_time - last_update_time) > self.PUBLISH_INTERVAL * 10
-                            if temp is not None and (self.last_published_temp is None or abs(temp - self.last_published_temp) > 0.1 or is_overdue):
-                                self.mqtt_manager.publish(self.TEMP_TOPIC, str(temp), retain=True)
-                                self.last_published_temp = temp
-                            if humid is not None and (self.last_published_humid is None or abs(humid - self.last_published_humid) > 1.0 or is_overdue):
-                                self.mqtt_manager.publish(self.HUMID_TOPIC, str(humid), retain=True)
-                                self.last_published_humid = humid
-                            if luminosity is not None and (self.last_published_lum is None or abs(luminosity - self.last_published_lum) > 5.0 or is_overdue):
-                                self.mqtt_manager.publish(self.LUM_TOPIC, str(luminosity), retain=True)
-                                self.last_published_lum = luminosity
-                                last_update_time = current_time
-                            
+                        # Publish data if changed
+                        is_overdue = (current_time - last_update_time) > self.PUBLISH_INTERVAL * 10
+                        if temp is not None and (self.last_published_temp is None or abs(temp - self.last_published_temp) > 0.1 or is_overdue):
+                            self.mqtt_manager.publish(self.TEMP_TOPIC, str(temp), retain=True)
+                            self.last_published_temp = temp
+                        if humid is not None and (self.last_published_humid is None or abs(humid - self.last_published_humid) > 1.0 or is_overdue):
+                            self.mqtt_manager.publish(self.HUMID_TOPIC, str(humid), retain=True)
+                            self.last_published_humid = humid
+                        if luminosity is not None and (self.last_published_lum is None or abs(luminosity - self.last_published_lum) > 5.0 or is_overdue):
+                            self.mqtt_manager.publish(self.LUM_TOPIC, str(luminosity), retain=True)
+                            self.last_published_lum = luminosity
+                            last_update_time = current_time
                     except Exception as e:
-                        print(f"MQTT Error in main loop: {e}")
+                        print(f"MQTT Error publishing sensors: {e}")
 
                 self.update_auto_light()
 
@@ -286,7 +313,10 @@ class MyGarden:
                     self.handle_ota_check()
 
                 last_log_time = current_time
-            time.sleep(0.5)
+            # Short idle so control commands are picked up promptly. When MQTT is
+            # connected, mqtt_manager.loop() above already blocks up to its
+            # socket_timeout, so this mainly paces the disconnected/BLE path.
+            time.sleep(0.1)
     
     def on_message(self, client, topic, message):
         print(f"Received message on topic {topic}: {message}")
@@ -313,8 +343,12 @@ class MyGarden:
                 brightness_val = int(float(message))
                 self.light_config["mode"] = "manual"
                 self.light_config["manual_brightness"] = brightness_val
-                self._save_light_config()
+                # Apply the PWM right away so the lamp tracks the slider live;
+                # defer the flash write (see _flush_pending_light_config) so a
+                # drag's burst of values doesn't trigger a write per step.
                 self.hw_manager.set_led_brightness_percent(brightness_val)
+                self._light_config_dirty = True
+                self._light_config_dirty_since = time.monotonic()
             except ValueError:
                 print("Received invalid brightness value")
         elif topic_suffix == "sync_history":
