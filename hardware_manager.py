@@ -61,11 +61,17 @@ class HardwareManager:
             time.sleep(duration / 2)
 
     def set_led_brightness_percent(self, percent):
-        if percent > 0:
+        if percent <= 0:
+            self.ledpin.duty_cycle = 0
+        elif percent >= 99:
+            # Fully open the MOSFET gate (steady-on, no PWM switching) so the
+            # strip draws maximum available power at the top of the slider.
+            # The max_duty_cycle cap is bypassed here on purpose: the gate
+            # driver needs full duty to push the strip as bright as it goes.
+            self.ledpin.duty_cycle = 65535
+        else:
             scaled_brightness = percent / 100.0
             self.ledpin.duty_cycle = int(self.max_duty_cycle * scaled_brightness)
-        else:
-            self.ledpin.duty_cycle = 0
 
     def read_sensor_cache(self):
         """Read temperature and humidity in a single AHT20 conversion and cache
