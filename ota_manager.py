@@ -2,12 +2,11 @@ import os
 import gc
 import microcontroller
 
-# adafruit_hashlib gives us SHA-256 on builds that lack a native `hashlib`.
-import adafruit_hashlib as hashlib
-
-# wifi / adafruit_connection_manager / adafruit_requests are imported lazily in
-# _session() so this module stays importable for the boot-time watchdog even if
-# a bad update damaged the lib/ bundle -- rollback only touches the filesystem.
+# adafruit_hashlib (SHA-256/HMAC), wifi, adafruit_connection_manager and
+# adafruit_requests are ALL imported lazily -- inside the functions that need
+# them -- so this module stays importable for the boot-time watchdog even if a
+# bad/interrupted update damaged the lib/ bundle. rollback_if_pending() only
+# touches the filesystem (os / microcontroller) and must never pull in a lib.
 
 
 # Where we persist what version is currently installed and whether the last
@@ -29,6 +28,7 @@ def _hmac_sha256(key, message):
 
     `key` and `message` are bytes; returns the lowercase hex digest string.
     """
+    import adafruit_hashlib as hashlib  # lazy: keep module importable at boot
     if len(key) > SHA_BLOCK:
         key = hashlib.new("sha256", key).digest()
     key = key + b"\x00" * (SHA_BLOCK - len(key))
@@ -176,13 +176,23 @@ class OtaManager:
     # --- boot watchdog (optional self-heal; GP2/USB is the hard fallback) ---
 
     def confirm_boot_ok(self):
-        """Clear the boot-pending flag once the new code is running cleanly."""
+        """Clear the boot-pending flag once the new code is running cleanly, and
+        drop the now-obsolete .bak copies.
+
+        Clearing boot_pending first (then deleting .bak) keeps the order safe: a
+        power loss in between leaves stale .bak files behind, but with
+        boot_pending already False the watchdog won't act on them. Removing the
+        backups stops a future watchdog pass from ever restoring stale code and
+        keeps the (small) filesystem tidy."""
         state = self._read_version_file()
-        if state.get("boot_pending"):
-            state["boot_pending"] = False
-            state["boot_attempts"] = 0
-            self._write_version_file(state)
-            print("OTA: boot confirmed OK, watchdog cleared")
+        if not state.get("boot_pending"):
+            return
+        state["boot_pending"] = False
+        state["boot_attempts"] = 0
+        self._write_version_file(state)
+        for path in state.get("files") or []:
+            self._safe_remove(path + BACKUP_SUFFIX)
+        print("OTA: boot confirmed OK, watchdog cleared")
 
     def rollback_if_pending(self):
         """Boot watchdog. Call this very early at boot.
@@ -210,16 +220,46 @@ class OtaManager:
         # Booted into this version before and it never confirmed -> bad code.
         files = state.get("files") or []
         print("OTA: unconfirmed boot -> rolling back")
-        restored = False
+        restored = 0
+        failed = 0
         for path in files:
             bak = path + BACKUP_SUFFIX
             try:
                 os.stat(bak)
             except OSError:
-                continue
-            self._safe_remove(path)
-            os.rename(bak, path)
-            restored = True
+                continue  # no backup for this file -> nothing to restore here
+            # Guard EACH file independently. The original code let a single
+            # os.rename() failure propagate out (and get swallowed by code.py),
+            # which deleted the live .py but left only the .bak -- exactly the
+            # stranded state that bricks the board. Now one bad file can't abort
+            # the others, and we verify the restore actually landed.
+            try:
+                self._safe_remove(path)
+                os.rename(bak, path)
+                os.stat(path)  # confirm the restored file is really there
+                restored += 1
+            except OSError as e:
+                print("OTA: rollback failed for", path, repr(e))
+                failed += 1
+
+        if failed:
+            # A managed file is still missing/un-restored. Do NOT clear
+            # boot_pending and do NOT fall through to running the app: the
+            # import cache is now inconsistent with disk, and letting the loop
+            # reach confirm_boot_ok() would wrongly clear the watchdog flag.
+            # Keep retrying on subsequent boots (code.py now runs the watchdog
+            # before importing the app), but cap the auto-reset attempts so a
+            # permanent FS fault degrades to "wait for GP2/USB" instead of a hot
+            # reset loop.
+            attempts = state.get("boot_attempts", 1) + 1
+            state["boot_attempts"] = attempts
+            self._write_version_file(state)
+            self._status("failed:rollback_incomplete")
+            if attempts <= 5:
+                microcontroller.reset()  # no return; retry from a clean boot
+            return True  # gave up auto-retry; GP2/USB is the hard fallback
+
+        # Full success (or there was nothing with a .bak to restore).
         state["boot_pending"] = False
         state["boot_attempts"] = 0
         state["version"] = state.get("previous_version", self.current_version)
@@ -270,7 +310,12 @@ class OtaManager:
         }
         self._write_version_file(state)
 
-        for path in paths:
+        # Commit code.py LAST. It's the entry point that runs the boot watchdog,
+        # so we keep the window in which it is briefly absent (mid-swap) as
+        # small and as late as possible. An interrupted swap of any OTHER file
+        # self-heals on the next boot, because the watchdog in code.py now runs
+        # before the app modules are imported.
+        for path in sorted(paths, key=lambda p: p == "code.py"):
             stage = path + STAGE_SUFFIX
             bak = path + BACKUP_SUFFIX
             try:
@@ -313,6 +358,7 @@ class OtaManager:
 
     def _stream_to_file(self, url, dest):
         """Download `url` to `dest` in chunks, returning the SHA-256 hex digest."""
+        import adafruit_hashlib as hashlib  # lazy: keep module importable at boot
         try:
             resp = self._session().get(url, headers=self._headers())
         except Exception as e:
